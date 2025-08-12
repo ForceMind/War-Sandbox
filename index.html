@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>War Sandbox — 原型</title>
+<style>
+  :root{--bg:#0f1115;--panel:#171a21;--accent:#e2b714;--muted:#9aa4b2;--good:#3ccf91;--bad:#ff6b6b}
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--bg);color:#e6e9ef;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+  #wrap{position:fixed;inset:0;display:grid;grid-template-rows:auto 1fr auto;gap:8px;padding:8px}
+  header,footer{display:flex;align-items:center;gap:8px;background:var(--panel);border-radius:12px;padding:8px 12px}
+  header h1{font-size:16px;margin:0 8px 0 0;letter-spacing:.5px}
+  header .sep{flex:1}
+  button,select,input{background:#212734;color:#e6e9ef;border:1px solid #2a3242;border-radius:10px;padding:6px 10px}
+  button:hover{border-color:#3a4356}
+  #hud{display:flex;gap:14px;align-items:center}
+  #canvasWrap{position:relative;background:#0b0d11;border-radius:12px;overflow:hidden}
+  #game{display:block;width:100%;height:100%}
+  #tooltip{position:absolute;pointer-events:none;left:0;top:0;background:#11161f;border:1px solid #263044;border-radius:8px;padding:6px 8px;font-size:12px;opacity:0;transition:opacity .08s}
+  #bn{position:absolute;left:50%;top:12px;transform:translateX(-50%);font-weight:600;background:#11161f;border:1px solid #2a3242;border-radius:999px;padding:6px 12px;font-size:12px;opacity:.9}
+  #events{display:flex;gap:8px;flex-wrap:wrap}
+  .pill{background:#11161f;border:1px solid #2a3242;border-radius:999px;padding:4px 10px;font-size:12px;opacity:.9}
+  .good{border-color:rgba(60,207,145,.35);color:var(--good)}
+  .bad{border-color:rgba(255,107,107,.35);color:var(--bad)}
+  #side{display:flex;gap:8px}
+  .card{background:var(--panel);border-radius:12px;padding:10px 12px;min-width:260px}
+  .card h3{margin:0 0 8px 0;font-size:14px;color:#cdd6e6}
+  .row{display:flex;align-items:center;gap:8px;margin:6px 0}
+  .slider{width:100%}
+  .kpi{font-weight:700;color:#cdd6e6}
+  .muted{color:var(--muted)}
+  .hint{font-size:12px;color:#a8b3c6}
+  .center{display:flex;justify-content:center;align-items:center}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <header>
+    <h1>War Sandbox</h1>
+    <div id="hud">
+      <span>城池 <b id="statCities">0</b></span>
+      <span>总兵力 <b id="statUnits">0</b></span>
+      <span>用时 <b id="statTime">0:00</b></span>
+      <span>速度 <b id="statSpeed">1x</b></span>
+    </div>
+    <div class="sep"></div>
+    <button id="btnPause" title="P">暂停</button>
+    <button id="btnSpeed">×2</button>
+    <button id="btnMute">静音</button>
+  </header>
+
+  <div id="canvasWrap">
+    <canvas id="game"></canvas>
+    <div id="tooltip"></div>
+    <div id="bn">拖拽己方城池 → 目标城池 发起出征</div>
+  </div>
+
+  <footer>
+    <div id="events" aria-live="polite"></div>
+    <div class="sep"></div>
+    <div class="hint">操作：点击或框选己方城池，拖到目标城池。P 暂停，×2 切换倍速。</div>
+  </footer>
+</div>
+
+<script>
+(()=>{
+'use strict';
+/* =============================
+   配置区（可调常量）
+============================= */
+const COLORS = { PLAYER:'#4da3ff', AI1:'#ff6b6b', AI2:'#e2b714', NEUTRAL:'#7f8a9b', FOG:'#0f1115' };
+const BG_GRID = true;
+const TIME_SCALE_STEPS = [1,2,4];
+const MAX_UNITS = 800;               // 最大同时存在士兵数量（性能保护）
+const CELL = 60;                      // 空间网格尺寸（像素）
+const REVERSE = { base:0.02, max:0.08, gapFactor:0.015 }; // 概率反杀参数
+const PROJECTILE_SPEED = 320;         // 远程弹速度
+const CAPTURE_SPEED = 0.35;           // 占领条推进速度系数
+const WALL_BASE = 80;                 // 基础城防耐久
+const PROD_TICK = 1.0;                // 产兵周期（秒）
+const RALLY_PERCENT_DEFAULT = 0.5;    // 默认派兵比例
+
+const UNIT = { // 兵种模板
+  INF:{name:'步兵',  hp:60,  atk:8,  atkInt:0.6, move:45, range:14,  cost:1, shape:'circle'},
+  CAV:{name:'骑兵',  hp:80,  atk:12, atkInt:0.7, move:70, range:14,  cost:2, shape:'triangle', charge:1.4},
+  ARC:{name:'弓兵',  hp:45,  atk:7,  atkInt:0.8, move:50, range:130, cost:2, shape:'square'},
+  SPE:{name:'长枪',  hp:90,  atk:9,  atkInt:0.8, move:35, range:14,  cost:2, shape:'diamond'},
+  SIE:{name:'攻城',  hp:220, atk:26, atkInt:1.4, move:22, range:48,  cost:5, shape:'rect', vsWall:2.2}
+};
+const COUNTER = { // 攻击方→被攻击方系数
+  INF:{ARC:1.25},
+  CAV:{ARC:1.6},
+  ARC:{INF:1.1,SPE:1.05},
+  SPE:{CAV:1.8},
+  SIE:{WALL:2.2}
+};
+
+// 地图（使用归一化位置，渲染时乘画布尺寸）
+const MAP = {
+  nodes:[
+    {id:1,name:'王都',pos:{x:.18,y:.58},level:3,owner:'PLAYER',prod:2.0,def:1.2},
+    {id:2,name:'荒原堡',pos:{x:.42,y:.24},level:2,owner:'NEUTRAL',prod:1.4,def:1.0},
+    {id:3,name:'矿脉镇',pos:{x:.70,y:.58},level:2,owner:'AI1',prod:1.6,def:1.1},
+    {id:4,name:'渡口',pos:{x:.36,y:.78},level:1,owner:'NEUTRAL',prod:1.1,def:.95},
+    {id:5,name:'林丘',pos:{x:.60,y:.35},level:1,owner:'NEUTRAL',prod:1.2,def:1.0}
+  ],
+  links:[[1,2],[2,3],[1,4],[4,2],[3,4],[2,5],[5,3]]
+};
+
+/* =============================
+   基础工具
+============================= */
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp=(a,b,t)=>a+(b-a)*t;
+const dist2=(a,b)=>{let dx=a.x-b.x,dy=a.y-b.y;return dx*dx+dy*dy};
+const rand=(a,b)=>a+Math.random()*(b-a);
+const nowMs=()=>performance.now();
+
+/* =============================
+   核心状态
+============================= */
+const state={
+  t:0, dt:0, last:nowMs(), paused:false, speed:1,
+  width:0,height:0, px:1,
+  nodes:[], edges:[], units:[], projs:[], events:[],
+  grid:null, cols:0, rows:0,
+  selected:null, dragTo:null,
+  rallyPercent:RALLY_PERCENT_DEFAULT,
+  audio: {mute:true}
+};
+
+/* =============================
+   画布初始化与自适应
+============================= */
+const cvs=document.getElementById('game');
+const ctx=cvs.getContext('2d');
+const tooltip=document.getElementById('tooltip');
+const statCities=document.getElementById('statCities');
+const statUnits=document.getElementById('statUnits');
+const statTime=document.getElementById('statTime');
+const statSpeed=document.getElementById('statSpeed');
+
+function resize(){
+  const wrap=document.getElementById('canvasWrap');
+  const w=wrap.clientWidth, h=wrap.clientHeight; 
+  const dpr=window.devicePixelRatio||1; 
+  cvs.width=w*dpr; cvs.height=h*dpr; cvs.style.width=w+'px'; cvs.style.height=h+'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  state.width=w; state.height=h; state.px=dpr;
+  buildGrid();
+}
+window.addEventListener('resize',resize);
+
+/* =============================
+   空间网格
+============================= */
+function buildGrid(){
+  state.cols=Math.ceil(state.width/CELL);
+  state.rows=Math.ceil(state.height/CELL);
+  state.grid=Array.from({length:state.cols*state.rows},()=>({units:[]}));
+}
+function cellIndex(x,y){
+  const cx=Math.floor(x/CELL), cy=Math.floor(y/CELL);
+  return clamp(cx,0,state.cols-1)+clamp(cy,0,state.rows-1)*state.cols;
+}
+function gridClear(){
+  for(const c of state.grid) c.units.length=0;
+}
+function gridInsert(u){
+  const idx=cellIndex(u.x,u.y); state.grid[idx].units.push(u); u._cell=idx;
+}
+
+/* =============================
+   地图构建
+============================= */
+function buildMap(){
+  state.nodes = MAP.nodes.map(n=>({
+    id:n.id,name:n.name, x:n.pos.x, y:n.pos.y, level:n.level,
+    owner:n.owner, prod:n.prod, def:n.def,
+    wall:WALL_BASE*n.def*n.level, capture:0,
+    pool:{INF:20,ARC:6,SPE:4,CAV:4,SIE:1}, // 初始守军（示意）
+    lastProd:0
+  }));
+  // 归一化坐标→像素
+  for(const nd of state.nodes){ nd.x*=state.width; nd.y*=state.height; }
+  state.edges = MAP.links.map(([a,b])=>({a:byId(a),b:byId(b)}));
+}
+function byId(id){ return state.nodes.find(n=>n.id===id); }
+
+/* =============================
+   单位/弹道 对象池
+============================= */
+function makeUnit(opts){ return Object.assign({
+  alive:true,f:opts.f||'PLAYER',type:opts.type||'INF',
+  x:opts.x,y:opts.y, vx:0,vy:0, target:null, tAtk:0, hp:UNIT[opts.type].hp,
+  range:UNIT[opts.type].range, move:UNIT[opts.type].move, atk:UNIT[opts.type].atk,
+  atkInt:UNIT[opts.type].atkInt, charge:UNIT[opts.type].charge||1, vsWall:UNIT[opts.type].vsWall||1,
+  r:6
+},opts);} 
+
+function makeProj(x,y,tx,ty,from){
+  return {x,y,tx,ty, from, alive:true, spd:PROJECTILE_SPEED};
+}
+
+/* =============================
+   产兵与派兵
+============================= */
+function nodeRadius(n){ return 28+8*(n.level-1); }
+function spawnAtNode(n, f, type, count){
+  for(let i=0;i<count;i++){
+    if(state.units.length>=MAX_UNITS) return; 
+    const ang=Math.random()*Math.PI*2, rr=nodeRadius(n)-10;
+    const u=makeUnit({f,type,x:n.x+Math.cos(ang)*rr,y:n.y+Math.sin(ang)*rr});
+    state.units.push(u);
+  }
+}
+function produce(dt){
+  for(const n of state.nodes){
+    n.lastProd += dt * n.prod;
+    if(n.lastProd>=PROD_TICK){
+      n.lastProd-=PROD_TICK;
+      if(n.owner!=='NEUTRAL'){
+        // 根据配比从 pool 决定产出类型（简单：按权重随机）
+        const weights=n.pool; const arr=[]; for(const k in weights){ for(let i=0;i<weights[k];i++) arr.push(k); }
+        const type=arr[Math.floor(Math.random()*arr.length)]||'INF';
+        spawnAtNode(n,n.owner,type,1);
+      }
+    }
+  }
+}
+
+function dispatch(from,to,percent){
+  if(!from||!to||from===to) return;
+  const troops=state.units.filter(u=>u.f===from.owner && dist2(u,from)<(nodeRadius(from)*nodeRadius(from)));
+  const send=Math.max(1,Math.floor(troops.length*percent));
+  for(let i=0;i<send;i++){
+    const u=troops[i]; if(!u) break; u.target=to; // 设为行军目标
+  }
+  pushEvent(`出征：${from.name} → ${to.name}（${send}人）`);
+}
+
+/* =============================
+   战斗与占领
+============================= */
+function counterCoef(att,def){ const tA=UNIT[att], tB=UNIT[def];
+  const co=COUNTER[att]||{}; return co[def]||1;
+}
+function tryReverseKill(attacker, defender){
+  // 依据战力差计算弱者反杀几率：差距越大，弱者概率略升
+  const aPow=attacker.atk/attacker.atkInt*attacker.hp;
+  const dPow=defender.atk/defender.atkInt*defender.hp;
+  let gap = Math.max(0, (aPow/dPow) - 1); // >0 表示攻击方更强
+  const p = clamp(REVERSE.base + gap*REVERSE.gapFactor, REVERSE.base, REVERSE.max);
+  if(Math.random()<p){ attacker.hp=0; attacker.alive=false; pushEvent('⚡ 概率反杀！', 'bad'); return true; }
+  return false;
+}
+
+function updateCombat(dt){
+  // 网格刷新
+  gridClear(); for(const u of state.units){ if(!u.alive) continue; gridInsert(u); }
+
+  // 单兵逻辑
+  for(const u of state.units){ if(!u.alive) continue;
+    // 目标选择
+    if(!u.target){
+      // 找最近敌军
+      let nearest=null, nd2=1e12; 
+      // 邻域搜索（当前格与周围八格）
+      const cx=Math.floor(u.x/CELL), cy=Math.floor(u.y/CELL);
+      for(let dx=-1;dx<=1;dx++) for(let dy=-1;dy<=1;dy++){
+        const ix=cx+dx, iy=cy+dy; if(ix<0||iy<0||ix>=state.cols||iy>=state.rows) continue;
+        const cell=state.grid[ix+iy*state.cols];
+        for(const v of cell.units){ if(!v.alive||v.f===u.f) continue; const d2=dist2(u,v); if(d2<nd2){ nd2=d2; nearest=v; } }
+      }
+      // 若无敌军，朝最近敌方城池移动
+      if(nearest){ u.target=nearest; } else {
+        let best=null, bd2=1e12; for(const n of state.nodes){ if(n.owner!==u.f){ const d2=dist2(u,n); if(d2<bd2){bd2=d2; best=n;} } }
+        u.target=best; 
+      }
+    }
+
+    // 移动/攻击
+    if(!u.target) continue;
+    const tgt=u.target; 
+    const isNode=(tgt.x===undefined?false:true)===false? false : ('wall' in tgt); // 粗判：节点对象带 wall
+
+    // 计算距离
+    const tx=tgt.x, ty=tgt.y; const dx=tx-u.x, dy=ty-u.y; const d=Math.hypot(dx,dy);
+
+    if(isNode){ // 目标为节点
+      const R=nodeRadius(tgt)*0.9; 
+      if(d>R){ // 前进
+        const sp=u.move*dt*state.speed; u.vx=dx/d*sp; u.vy=dy/d*sp; u.x+=u.vx; u.y+=u.vy;
+      }else{ // 进入城池战斗：优先打城防
+        if(tgt.wall>0){
+          u.tAtk-=dt*state.speed; if(u.tAtk<=0){
+            const coef = (UNIT[u.type].vsWall||1) * ((COUNTER[u.type] && COUNTER[u.type].WALL)||1);
+            tgt.wall -= Math.max(1, u.atk*coef);
+            u.tAtk = u.atkInt;
+          }
+        } else {
+          // 与守军/驻军作战：就近敌军（同格近邻已处理），这里可推进占领进度
+          tgt.capture += CAPTURE_SPEED * dt * state.speed; 
+          if(tgt.capture>=100){ changeOwner(tgt, u.f); }
+        }
+      }
+    } else { // 目标为敌军
+      if(d>u.range){
+        const sp=u.move*dt*state.speed; u.vx=dx/d*sp; u.vy=dy/d*sp; u.x+=u.vx; u.y+=u.vy;
+      } else {
+        // 可攻击
+        u.tAtk-=dt*state.speed; if(u.tAtk<=0){ u.tAtk=u.atkInt;
+          if(UNIT[u.type].range>40){ // 远程：发射弹体
+            state.projs.push(makeProj(u.x,u.y,tgt.x,tgt.y,u));
+          } else { // 近战：直接结算并尝试反杀
+            let dmg=u.atk * counterCoef(u.type, tgt.type);
+            if(u.type==='CAV') dmg*=u.charge; 
+            // 目标尝试反杀
+            const killed = tryReverseKill(u,tgt); if(!killed){ tgt.hp-=dmg; if(tgt.hp<=0){ tgt.alive=false; pushEvent('击杀 +1','good'); u.target=null; } }
+          }
+        }
+      }
+    }
+  }
+
+  // 弹道更新
+  for(const p of state.projs){ if(!p.alive) continue; 
+    const dx=p.tx-p.x, dy=p.ty-p.y; const d=Math.hypot(dx,dy);
+    if(d<6){ // 命中
+      // 找到邻近敌军（半径 20）
+      let hit=null, nd2=400; for(const u of state.units){ if(!u.alive||u.f===p.from.f) continue; const d2=dist2(u,p); if(d2<nd2){ nd2=d2; hit=u; } }
+      if(hit){
+        let dmg=p.from.atk * counterCoef(p.from.type, hit.type);
+        hit.hp-=dmg; if(hit.hp<=0){ hit.alive=false; pushEvent('远程击杀','good'); }
+      }
+      p.alive=false; continue;
+    }
+    const sp=p.spd*dt*state.speed; p.x+=dx/d*sp; p.y+=dy/d*sp;
+  }
+
+  // 清理死亡
+  state.units=state.units.filter(u=>u.alive);
+  state.projs=state.projs.filter(p=>p.alive);
+}
+
+function changeOwner(node, newOwner){
+  node.owner=newOwner; node.capture=0; node.wall=WALL_BASE*node.def*node.level;
+  pushEvent(`🏳️ 占领 ${node.name} 成功`, 'good');
+}
+
+/* =============================
+   AI 逻辑（极简可玩）
+============================= */
+let aiTimer=0;
+function updateAI(dt){
+  aiTimer-=dt*state.speed; if(aiTimer>0) return; aiTimer=rand(2,4); // 每 2~4 秒决策一次
+  const aiNodes=state.nodes.filter(n=>n.owner.startsWith('AI'));
+  const targets=state.nodes.filter(n=>n.owner!=='AI1');
+  if(aiNodes.length===0) return;
+  const src=aiNodes[Math.floor(Math.random()*aiNodes.length)];
+  // 选择最近的中立或玩家城
+  let best=null, bd2=1e12; for(const t of targets){ if(t===src) continue; const d2=dist2(src,t); if(d2<bd2){bd2=d2;best=t;} }
+  if(best){ dispatch(src,best,0.5); }
+}
+
+/* =============================
+   渲染
+============================= */
+function drawGrid(){
+  if(!BG_GRID) return; ctx.save(); ctx.strokeStyle='#12151b'; ctx.lineWidth=1;
+  for(let x=0;x<state.width;x+=CELL){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,state.height); ctx.stroke(); }
+  for(let y=0;y<state.height;y+=CELL){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(state.width,y); ctx.stroke(); }
+  ctx.restore();
+}
+function drawEdges(){ ctx.save(); ctx.strokeStyle='#1e242f'; ctx.lineWidth=2; for(const e of state.edges){ ctx.beginPath(); ctx.moveTo(e.a.x,e.a.y); ctx.lineTo(e.b.x,e.b.y); ctx.stroke(); } ctx.restore(); }
+function drawNodes(){
+  for(const n of state.nodes){
+    const R=nodeRadius(n);
+    ctx.save();
+    // 圈与填色
+    ctx.beginPath(); ctx.arc(n.x,n.y,R,0,Math.PI*2);
+    ctx.fillStyle = (n.owner==='PLAYER')? '#0d2740' : (n.owner==='AI1')? '#401a1a' : (n.owner==='AI2')? '#3c3310' : '#1f2430';
+    ctx.fill(); ctx.lineWidth=3; ctx.strokeStyle=(COLORS[n.owner]||'#4b5565'); ctx.stroke();
+
+    // 占领进度
+    if(n.owner!=='NEUTRAL' && n.capture>0){
+      ctx.beginPath(); ctx.strokeStyle='#d6e0f5'; ctx.lineWidth=4;
+      ctx.arc(n.x,n.y,R+4,-Math.PI/2,-Math.PI/2+Math.min(1,n.capture/100)*Math.PI*2);
+      ctx.stroke();
+    }
+
+    // 城防条
+    const wallPct=clamp(n.wall/(WALL_BASE*n.def*n.level),0,1);
+    const bw=R*1.5, bh=6; ctx.fillStyle='#12161f'; ctx.fillRect(n.x-bw/2,n.y+R+8,bw,bh);
+    ctx.fillStyle=wallPct>0.5?'#39d0a8':'#f1c40f'; ctx.fillRect(n.x-bw/2,n.y+R+8,bw*wallPct,bh);
+
+    // 名称
+    ctx.fillStyle='#cdd6e6'; ctx.font='12px system-ui'; ctx.textAlign='center';
+    ctx.fillText(`${n.name} Lv${n.level}`, n.x, n.y-R-8);
+    ctx.restore();
+  }
+}
+function drawUnits(){
+  for(const u of state.units){ ctx.save(); ctx.translate(u.x,u.y);
+    ctx.fillStyle = (COLORS[u.f]||'#8899aa');
+    switch(UNIT[u.type].shape){
+      case 'circle': ctx.beginPath(); ctx.arc(0,0,3.5,0,Math.PI*2); ctx.fill(); break;
+      case 'triangle': ctx.beginPath(); ctx.moveTo(0,-4); ctx.lineTo(4,4); ctx.lineTo(-4,4); ctx.closePath(); ctx.fill(); break;
+      case 'square': ctx.fillRect(-3,-3,6,6); break;
+      case 'diamond': ctx.beginPath(); ctx.moveTo(0,-4); ctx.lineTo(4,0); ctx.lineTo(0,4); ctx.lineTo(-4,0); ctx.closePath(); ctx.fill(); break;
+      case 'rect': ctx.fillRect(-5,-3,10,6); break;
+    }
+    ctx.restore();
+  }
+  // 弹道
+  ctx.save(); ctx.strokeStyle='#d8dee9'; ctx.lineWidth=1.5; for(const p of state.projs){ ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.tx,p.ty); ctx.stroke(); } ctx.restore();
+}
+
+function render(){
+  ctx.clearRect(0,0,state.width,state.height);
+  drawGrid(); drawEdges(); drawNodes(); drawUnits();
+  // 拖拽提示箭头
+  if(state.selected && state.dragTo){
+    const a=state.selected, b=state.dragTo; ctx.save(); ctx.strokeStyle='#d6e0f5'; ctx.setLineDash([6,4]); ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); ctx.setLineDash([]);
+    ctx.restore();
+  }
+}
+
+/* =============================
+   事件/提示
+============================= */
+const eventsEl=document.getElementById('events');
+function pushEvent(text,type){
+  const span=document.createElement('span'); span.className='pill'+(type?(' '+type):''); span.textContent=text; eventsEl.prepend(span);
+  setTimeout(()=>span.remove(), 4200);
+}
+
+/* =============================
+   主循环
+============================= */
+function tick(){
+  const t=nowMs(); const raw=(t-state.last)/1000; state.last=t; state.dt=raw; if(state.paused){ render(); requestAnimationFrame(tick); return; }
+  const dt=state.dt; // 真实 dt，速度在各系统里乘
+  state.t+=dt*state.speed;
+
+  produce(dt);
+  updateAI(dt);
+  updateCombat(dt);
+  render();
+  updateHUD();
+  requestAnimationFrame(tick);
+}
+
+function updateHUD(){
+  const timeSec=Math.floor(state.t); const m=Math.floor(timeSec/60), s=timeSec%60; statTime.textContent=`${m}:${s.toString().padStart(2,'0')}`;
+  statUnits.textContent=state.units.length.toString();
+  const myCities=state.nodes.filter(n=>n.owner==='PLAYER').length; statCities.textContent=myCities.toString();
+  statSpeed.textContent = state.speed+'x';
+}
+
+/* =============================
+   交互：选择与拖拽派兵
+============================= */
+let mouse={x:0,y:0, down:false};
+function pickNodeAt(x,y){ for(const n of state.nodes){ if(Math.hypot(x-n.x,y-n.y)<=nodeRadius(n)) return n; } return null; }
+
+cvs.addEventListener('mousemove',e=>{
+  const rect=cvs.getBoundingClientRect(); mouse.x=e.clientX-rect.left; mouse.y=e.clientY-rect.top;
+  const n=pickNodeAt(mouse.x,mouse.y);
+  if(n){ tooltip.style.opacity=1; tooltip.style.transform=`translate(${mouse.x+12}px,${mouse.y+12}px)`;
+    tooltip.innerHTML=`<b>${n.name}</b> Lv${n.level}<br>所属：${n.owner}<br>产兵：${n.prod.toFixed(2)}/s<br>城防：${Math.round(n.wall)}`;
+  } else { tooltip.style.opacity=0; }
+  if(mouse.down && state.selected){ state.dragTo=n; }
+});
+
+cvs.addEventListener('mousedown',e=>{ mouse.down=true; const n=pickNodeAt(mouse.x,mouse.y); if(n && n.owner==='PLAYER'){ state.selected=n; } });
+
+cvs.addEventListener('mouseup',e=>{ mouse.down=false; const n=pickNodeAt(mouse.x,mouse.y); if(state.selected && n){ if(n!==state.selected){ dispatch(state.selected,n,state.rallyPercent); } }
+  state.selected=null; state.dragTo=null; });
+
+/* =============================
+   控件/快捷键
+============================= */
+const btnPause=document.getElementById('btnPause');
+const btnSpeed=document.getElementById('btnSpeed');
+const btnMute=document.getElementById('btnMute');
+let speedIdx=0;
+btnPause.onclick=()=>{ state.paused=!state.paused; btnPause.textContent=state.paused?'继续':'暂停'; };
+btnSpeed.onclick=()=>{ speedIdx=(speedIdx+1)%TIME_SCALE_STEPS.length; state.speed=TIME_SCALE_STEPS[speedIdx]; btnSpeed.textContent='×'+TIME_SCALE_STEPS[(speedIdx+1)%TIME_SCALE_STEPS.length]; };
+btnMute.onclick=()=>{ state.audio.mute=!state.audio.mute; btnMute.textContent=state.audio.mute?'静音':'已静音'; };
+window.addEventListener('keydown',e=>{
+  if(e.key==='p' || e.key==='P') btnPause.click();
+});
+
+/* =============================
+   启动
+============================= */
+function start(){ resize(); buildMap(); pushEvent('欢迎指挥官，拖拽己方城池发起出征'); requestAnimationFrame(tick); }
+start();
+
+})();
+</script>
+</html>
